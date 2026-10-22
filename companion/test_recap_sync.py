@@ -1,0 +1,86 @@
+import copy
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+import recap_sync as r
+
+REQ = {'version': 1, 'book_id': 'a'*32, 'title': 'Test', 'text': 'Anfang.\n',
+       'cutoff': '/body/p[2]', 'activity': 1, 'opened': 1, 'session': 1}
+
+
+class SyncTest(unittest.TestCase):
+    def test_required_sections_and_old_cache_migration(self):
+        complete = '\n\n'.join(heading + '\nInhalt?' for heading in r.SECTIONS)
+        self.assertEqual(r.validate_summary(complete), complete)
+        with self.assertRaises(ValueError):
+            r.validate_summary(complete.split(r.SECTIONS[-1])[0])
+        with self.assertRaises(ValueError):
+            r.validate_summary(complete.split(r.SECTIONS[-1])[0] + r.SECTIONS[-1])
+        calls = []
+        def model(title, previous, excerpt, exe):
+            calls.append((previous, excerpt))
+            return complete
+        old = {'source_length': len(REQ['text']), 'source_hash': r.digest(REQ['text']),
+               'summary': 'Alter Rückblick ohne Fragen.'}
+        result = r.build(REQ, old, 'fake', model)
+        self.assertEqual(calls, [('', REQ['text'])])
+        self.assertEqual(result['format_version'], r.FORMAT_VERSION)
+        empty = r.build(dict(REQ, text=''), None, 'fake', model)
+        r.validate_summary(empty['summary'])
+
+    def test_incremental_and_backward_spoiler_guard(self):
+        calls = []
+        def model(title, previous, excerpt, exe):
+            calls.append((previous, excerpt))
+            return previous + excerpt
+        first = r.build(REQ, None, 'unused', model)
+        more = dict(REQ, text=REQ['text']+'Danach.', session=2)
+        second = r.build(more, first, 'unused', model)
+        self.assertEqual(calls[-1], ('Anfang.\n', 'Danach.'))
+        r.build(REQ, second, 'unused', model)
+        self.assertEqual(calls[-1], ('', 'Anfang.\n'))
+        n = len(calls)
+        reopened = r.build(dict(more, session=3), second, 'unused', model)
+        self.assertEqual(len(calls), n)
+        self.assertNotEqual(reopened['request_id'], second['request_id'])
+
+    def test_repeat_delivery_failure_retry_and_multiple_books(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent.resolve()) as t, patch.object(r, 'HERE', Path(t)/'pc'):
+            r.HERE.mkdir()
+            device = Path(t)/'device'
+            requests = device/'koreader/settings/reading_recap_requests'
+            requests.mkdir(parents=True)
+            calls = []
+            def model(*args):
+                calls.append(args)
+                return 'Eine überprüfbare Zusammenfassung.'
+            for key in ['a','b']:
+                r.atomic_json(requests/(key*32+'.json'), dict(REQ, book_id=key*32))
+            self.assertEqual(r.sync(device, 'fake', model), 0)
+            self.assertEqual(len(calls), 2)
+            r.sync(device, 'fake', model)
+            self.assertEqual(len(calls), 2)
+            dest = device/'koreader/settings/reading_recaps'/('a'*32+'.json')
+            dest.unlink()
+            r.sync(device, 'fake', model)
+            self.assertTrue(dest.exists())
+            self.assertEqual(len(calls), 2)
+            changed = dict(REQ, text='Neuer Text.', session=4)
+            r.atomic_json(requests/('a'*32+'.json'), changed)
+            before = dest.read_bytes()
+            def fail(*args): raise RuntimeError('offline')
+            self.assertEqual(r.sync(device, 'fake', fail), 1)
+            self.assertEqual(dest.read_bytes(), before)
+            self.assertEqual(r.sync(device, 'fake', model), 0)
+
+    def test_validation_and_chunk_coverage(self):
+        r.validate(REQ, 'a'*32+'.json')
+        with self.assertRaises(ValueError): r.validate(REQ, '../bad.json')
+        text = 'abc\n'*40000
+        self.assertEqual(''.join(r.chunks(text)), text)
+        self.assertTrue(all(len(x)<=60000 for x in r.chunks(text)))
+
+
+if __name__ == '__main__': unittest.main()
