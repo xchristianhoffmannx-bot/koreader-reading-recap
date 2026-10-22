@@ -11,6 +11,11 @@ REQ = {'version': 1, 'book_id': 'a'*32, 'title': 'Test', 'text': 'Anfang.\n',
 
 
 class SyncTest(unittest.TestCase):
+    def setUp(self):
+        config = patch.object(r.ai_providers, 'load_settings', return_value={'provider': 'codex'})
+        config.start()
+        self.addCleanup(config.stop)
+
     def test_required_sections_and_old_cache_migration(self):
         complete = '\n\n'.join(heading + '\nInhalt?' for heading in r.SECTIONS)
         self.assertEqual(r.validate_summary(complete), complete)
@@ -81,6 +86,29 @@ class SyncTest(unittest.TestCase):
         text = 'abc\n'*40000
         self.assertEqual(''.join(r.chunks(text)), text)
         self.assertTrue(all(len(x)<=60000 for x in r.chunks(text)))
+
+    def test_api_sync_needs_no_codex_and_provider_change_rebuilds(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent.resolve()) as t, patch.object(r, 'HERE', Path(t)/'pc'):
+            r.HERE.mkdir()
+            device = Path(t)/'device'
+            path = device/'koreader/settings/reading_recap_requests'/('a'*32+'.json')
+            r.atomic_json(path, REQ)
+            complete = '\n\n'.join(heading + '\nInhalt?' for heading in r.SECTIONS)
+            with patch.object(r.ai_providers, 'load_settings', return_value={'provider':'openai','model':'test-one','key':'fake'}), \
+                 patch.object(r, 'find_codex', side_effect=AssertionError('Must not require Codex')), \
+                 patch.object(r.ai_providers, 'summarize', return_value=complete) as model:
+                self.assertEqual(r.sync(device), 0)
+                self.assertEqual(model.call_count, 1)
+                self.assertEqual(r.sync(device), 0)
+                self.assertEqual(model.call_count, 1)
+                first = json.loads((r.HERE/'recap-cache'/path.name).read_text())
+                with patch.object(r.ai_providers, 'load_settings', return_value={'provider':'gemini','model':'test-two','key':'fake'}):
+                    self.assertEqual(r.sync(device), 0)
+                second = json.loads((r.HERE/'recap-cache'/path.name).read_text())
+                self.assertNotEqual(first['request_id'], second['request_id'])
+                self.assertEqual(second['generator'], 'gemini:test-two')
+                payload = json.loads(model.call_args.args[0].split('\n', 1)[1])
+                self.assertEqual(payload['previous_recap'], '')
 
 
 if __name__ == '__main__': unittest.main()

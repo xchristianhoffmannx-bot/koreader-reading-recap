@@ -1,4 +1,4 @@
-"""Generate and deliver recaps for KOReader-exported read prefixes via signed-in Codex."""
+"""Generate and deliver KOReader recaps via Codex or a user-selected API provider."""
 import argparse
 import datetime
 import hashlib
@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import ai_providers
 
 HERE = Path(__file__).resolve().parent
 FORMAT_VERSION = 2
@@ -53,14 +54,14 @@ def digest(text):
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
 
 
-def request_id(request):
-    return digest(json.dumps({'format_version': FORMAT_VERSION, 'request': request},
+def request_id(request, generator='codex'):
+    return digest(json.dumps({'format_version': FORMAT_VERSION, 'generator': generator, 'request': request},
                             sort_keys=True, ensure_ascii=False))
 
 
 def validate_summary(summary):
     if not isinstance(summary, str) or len(summary.strip()) < 30 or len(summary) > 16000:
-        raise ValueError('Invalid Codex recap')
+        raise ValueError('Invalid recap')
     remaining = summary
     for heading in SECTIONS:
         if heading not in remaining.splitlines():
@@ -82,7 +83,7 @@ def chunks(text, size=60000):
         text = text[end:]
 
 
-def generate(title, previous, excerpt, codex):
+def make_prompt(title, previous, excerpt):
     prompt = (
         'Erstelle ausschließlich eine deutsche Leserückblende als JSON gemäß Schema. '
         'Nutze keine Werkzeuge, Dateien, Websuche oder eigenes Wissen über das Buch. '
@@ -104,6 +105,11 @@ def generate(title, previous, excerpt, codex):
         'Keine erfundenen Details. Antworte nur mit {"summary":"..."}.\n' +
         json.dumps({'title': title, 'previous_recap': previous, 'read_text': excerpt}, ensure_ascii=False)
     )
+    return prompt
+
+
+def generate(title, previous, excerpt, codex):
+    prompt = make_prompt(title, previous, excerpt)
     run_dir = HERE / 'recap-work'
     run_dir.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=run_dir) as tmp:
@@ -128,7 +134,7 @@ def generate(title, previous, excerpt, codex):
         return validate_summary(summary)
 
 
-def build(request, previous, codex, summarizer=generate):
+def build(request, previous, codex, summarizer=generate, generator='codex'):
     text = request['text']
     summary = ''
     offset = 0
@@ -146,11 +152,11 @@ def build(request, previous, codex, summarizer=generate):
                    'WAS BISHER GESCHIEHT\nEs liegt noch kein gelesener Text für einen Rückblick vor.\n\n'
                    'DIE WICHTIGSTEN FIGUREN\nNoch keine Figuren oder Begriffe aus gelesenem Text verfügbar.\n\n'
                    'OFFENE FRAGEN AN DEINER LESESTELLE\nNoch keine belegbaren offenen Fragen.')
-    key = request_id(request)
+    key = request_id(request, generator)
     today = datetime.datetime.now().astimezone().strftime('%d.%m.%Y %H:%M')
     response = {'id': key, 'book_id': request['book_id'], 'title': request['title'],
                 'cutoff': request['cutoff'], 'text': f'Leserückblick · Stand {today}\n\n{summary}'}
-    return {'request_id': key, 'format_version': FORMAT_VERSION,
+    return {'request_id': key, 'format_version': FORMAT_VERSION, 'generator': generator,
             'source_length': len(text), 'source_hash': digest(text),
             'summary': summary, 'response': response}
 
@@ -161,9 +167,17 @@ def sync(device, codex=None, summarizer=generate):
     if not requests.exists():
         print('Rückblicke: noch keine KOReader-Leseexporte; nach Plugin-Neustart lesen und erneut anschließen.')
         return 0
-    codex = codex or find_codex()
-    if not codex:
-        raise RuntimeError('Codex executable not found')
+    provider_config = ai_providers.load_settings()
+    generator = provider_config['provider']
+    if generator == 'codex':
+        codex = codex or find_codex()
+        if not codex:
+            raise RuntimeError('Codex executable not found')
+    else:
+        generator += ':' + provider_config['model']
+        if summarizer is generate:
+            def summarizer(title, previous, excerpt, unused):
+                return validate_summary(ai_providers.summarize(make_prompt(title, previous, excerpt), provider_config))
     cache = HERE / 'recap-cache'
     cache.mkdir(exist_ok=True)
     count = failures = 0
@@ -183,10 +197,12 @@ def sync(device, codex=None, summarizer=generate):
             try:
                 request = json.loads(path.read_text(encoding='utf-8'))
                 validate(request, path.name)
-                key = request_id(request)
+                key = request_id(request, generator)
                 state_file = cache / path.name
                 old = json.loads(state_file.read_text(encoding='utf-8')) if state_file.exists() else None
-                state = old if old and old.get('request_id') == key else build(request, old, codex, summarizer)
+                if old and old.get('generator', 'codex') != generator:
+                    old = None
+                state = old if old and old.get('request_id') == key else build(request, old, codex, summarizer, generator)
                 if state is not old:
                     atomic_json(state_file, state)
                 dest = settings / 'reading_recaps' / path.name

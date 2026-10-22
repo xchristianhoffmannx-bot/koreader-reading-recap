@@ -2,7 +2,7 @@
 
 Return to a book with a short recap of what you have already read, including the questions still open at your reading position.
 
-This project has two parts: a KOReader plugin exports text up to the current reading position, and a Windows companion uses **your own signed-in Codex CLI** to generate and deliver a recap when the reader is connected over USB. New recaps are offered once when opening or resuming a book and remain available from the reader menu.
+This project has two parts: a KOReader plugin exports text up to the current reading position, and a Windows companion uses **your own AI account** to generate and deliver a recap when the reader is connected over USB. Choose a signed-in Codex CLI, or your own OpenAI, Anthropic, or Google Gemini API key. New recaps are offered once when opening or resuming a book and remain available from the reader menu.
 
 ## Status
 
@@ -14,8 +14,31 @@ The interface and generated recaps are currently **German**. Each recap has four
 
 - A device with KOReader installed and its `koreader` directory accessible over USB.
 - Windows and Python **3.11 or later**, available as `python`.
-- The official [Codex CLI](https://developers.openai.com/codex/cli/) installed and signed in with your own account (`codex login`). No shared credentials or API key are included.
-- Internet access and available Codex usage allowance. A working modern Codex CLI with `exec --ephemeral --output-schema --ignore-user-config` is required.
+- Either the official [Codex CLI](https://developers.openai.com/codex/cli/) signed in with your own account (`codex login`), **or** your own API key for one of the providers below. Codex is not required in API mode.
+- Internet access and available allowance/API billing for your chosen provider. Codex mode requires a modern CLI with `exec --ephemeral --output-schema --ignore-user-config`. API mode uses Python's standard library and needs no provider SDK.
+
+## Choose your AI provider
+
+Run this once before the first sync (or again to change provider/model/key):
+
+```powershell
+.\companion\configure.ps1
+```
+
+Choose `codex`, `openai`, `anthropic`, or `gemini`. For an API provider, enter the exact model ID from your account and then paste your API key at the hidden prompt. Choose a text model with sufficient context for approximately 60,000 source characters plus an earlier recap (at least 32k context is a useful starting point; tokenization varies). OpenAI models must support Chat Completions and JSON mode. No particular model is hardcoded, since availability depends on your account and changes over time.
+
+| Selection | Account/key | Request API |
+|---|---|---|
+| `codex` (default) | Your signed-in Codex CLI | Non-interactive Codex; no API key required |
+| `openai` | [OpenAI API keys](https://platform.openai.com/api-keys) | [Chat Completions](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create) |
+| `anthropic` | [Anthropic Console](https://platform.claude.com/) | [Messages API](https://platform.claude.com/docs/en/api/messages/create) |
+| `gemini` | [Google AI Studio API keys](https://aistudio.google.com/apikey) | [GenerateContent](https://ai.google.dev/api/generate-content) |
+
+Chat subscriptions do not automatically provide API billing or credit. Check model access, pricing and limits with your chosen provider. Requests are capped at 4,096 output tokens for Anthropic and 8,192 for OpenAI/Gemini; these are upper bounds, not targets. The source is processed in chunks, so long first reads can make multiple paid calls.
+
+The setup stores `provider.json` in `%LOCALAPPDATA%\KOReaderReadingRecap`, **outside the repository**. The key is encrypted using Windows DPAPI for the current Windows user; moving this file to another computer/account will not provide a working key. Re-run setup there. This protects storage, but does not protect against programs already running as you. Setup does not make a paid test call. The existing USB task automatically uses this configuration on its next run under the same Windows user.
+
+Advanced users can instead set `RECAP_PROVIDER`, `RECAP_MODEL` and the matching `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY` in the environment of the sync process. Environment values take precedence. In API mode a missing key/model is an error: the helper never silently switches to Codex or another provider. With no configuration, Codex remains the default. Switching provider or model regenerates affected recaps from their bounded source; it can incur new API usage.
 
 ## Install
 
@@ -36,7 +59,7 @@ The interface and generated recaps are currently **German**. Each recap has four
    .\companion\sync.ps1 -Device 'F:\'
    ```
 
-   If PowerShell blocks local scripts, review the script and use a process-only policy for this invocation:
+   If PowerShell blocks local scripts, review the script and use a process-only policy for this invocation (the same form works for `configure.ps1`):
 
    ```powershell
    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\companion\sync.ps1
@@ -58,7 +81,7 @@ Do not register this additional task if an existing backup job already calls `re
 
 ## Privacy and limitations
 
-- **Read text is sent to OpenAI through your own Codex account.** Generation uses your Codex allowance. Long first reads may require multiple calls. Subsequent forward reading can reuse the earlier recap and summarize only additional text.
+- **Read text is sent to your selected provider**: OpenAI for Codex/OpenAI API mode, Anthropic for Claude API mode, or Google for Gemini. Generation uses your Codex allowance or API billing. Long first reads may require multiple calls. Subsequent forward reading can reuse the earlier recap and summarize only additional text. A failed request is retried only on a later sync; automatic immediate retries are not made.
 - KOReader exports from the first page to the current text position using its own XPointer functions. This avoids estimating a text boundary from percentages. It is **not a guarantee against spoilers or AI mistakes**: front matter can itself reveal plot, and a language model may infer or invent details.
 - Skipping forward is treated as reaching that position, even if you did not read the intervening pages. A prepared recap is hidden if you move back before its boundary.
 - Each newly opened/read session can produce a new delivered revision. If the text has not changed, the companion reuses the summary without another AI call. An identical repeated connection does nothing.
@@ -68,13 +91,13 @@ Do not register this additional task if an existing backup job already calls `re
 
 ## Tests
 
-No network or Codex allowance is used by these tests:
+No network, real API keys, or paid allowance is used by these tests:
 
 ```powershell
 python -m unittest discover -s companion -p 'test_*.py'
 ```
 
-They cover required sections, old-format cache migration, incremental and backwards reading, repeated sync, delivery retry, multiple books, request validation and chunk coverage. The Lua plugin has also been tested with a local LuaJIT mock harness during development; that harness is not included in this first package. Real-device testing remains necessary for other devices and KOReader versions.
+They cover provider request formats/authentication, truncated/error responses, no-Codex API sync, provider switching, Windows key encryption/decryption with a synthetic key, required sections, old-format cache migration, incremental and backwards reading, repeated sync, delivery retry, multiple books, request validation and chunk coverage. The Windows encryption test writes only temporary configuration and does not change your saved settings. API requests are mocked: the new API backends have not been live-tested with billed credentials. The Lua plugin has also been tested with a local LuaJIT mock harness during development; that harness is not included in this first package. Real-device testing remains necessary for other devices and KOReader versions.
 
 ## Uninstall
 
