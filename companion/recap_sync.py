@@ -140,7 +140,7 @@ def generate(title, previous, excerpt, codex):
         return validate_summary(summary)
 
 
-def build(request, previous, codex, summarizer=generate, generator='codex'):
+def build(request, previous, codex, summarizer=generate, generator='codex', checkpoint=None):
     text = request['text']
     summary = ''
     offset = 0
@@ -149,9 +149,21 @@ def build(request, previous, codex, summarizer=generate, generator='codex'):
         if old_len > 0 and old_len <= len(text) and digest(text[:old_len]) == previous.get('source_hash'):
             offset = old_len
             summary = previous['summary']
+    consumed = offset
     for part in chunks(text[offset:]):
         if part.strip():
             summary = summarizer(request['title'], summary, part, codex)
+        consumed += len(part)
+        if checkpoint and consumed < len(text):
+            # Save progress after every paid chunk so a later failure resumes here instead of
+            # starting over. request_id=None marks it unfinished: it is never delivered and the
+            # normal prefix check above picks it up as `previous` on the next run.
+            try:
+                checkpoint({'request_id': None, 'partial': True, 'format_version': FORMAT_VERSION,
+                            'generator': generator, 'source_length': consumed,
+                            'source_hash': digest(text[:consumed]), 'summary': summary})
+            except OSError:
+                pass  # best effort: a failed checkpoint only means this chunk is repeated later
     # A reopened unchanged text gets a new delivery revision without another AI call.
     if not summary:
         summary = ('WO WIR SIND\nDu stehst noch am Anfang.\n\n'
@@ -208,7 +220,9 @@ def sync(device, codex=None, summarizer=generate):
                 old = json.loads(state_file.read_text(encoding='utf-8')) if state_file.exists() else None
                 if old and old.get('generator', 'codex') != generator:
                     old = None
-                state = old if old and old.get('request_id') == key else build(request, old, codex, summarizer, generator)
+                state = old if old and old.get('request_id') == key else build(
+                    request, old, codex, summarizer, generator,
+                    checkpoint=lambda partial: atomic_json(state_file, partial))
                 if state is not old:
                     atomic_json(state_file, state)
                 dest = settings / 'reading_recaps' / path.name

@@ -113,6 +113,91 @@ class SyncTest(unittest.TestCase):
                 self.assertEqual(payload['previous_recap'], '')
 
 
+LONG_TEXT = 'abc\n' * 60000  # 240,000 characters = exactly 4 chunks of 60,000
+
+
+class CheckpointTest(unittest.TestCase):
+    def setUp(self):
+        config = patch.object(r.ai_providers, 'load_settings', return_value={'provider': 'codex'})
+        config.start()
+        self.addCleanup(config.stop)
+
+    def test_build_saves_progress_per_chunk_and_resumes_after_failure(self):
+        self.assertEqual(len(list(r.chunks(LONG_TEXT))), 4)
+        request = dict(REQ, text=LONG_TEXT)
+        saved, calls = [], []
+        def flaky(title, previous, excerpt, exe):
+            calls.append(excerpt)
+            if len(calls) == 3:
+                raise RuntimeError('offline')
+            return previous + 'x'
+        with self.assertRaises(RuntimeError):
+            r.build(request, None, 'unused', flaky, checkpoint=saved.append)
+        self.assertEqual([s['source_length'] for s in saved], [60000, 120000])
+        partial = saved[-1]
+        self.assertTrue(partial['partial'])
+        self.assertIsNone(partial['request_id'])
+        self.assertEqual(partial['summary'], 'xx')
+
+        resumed = []
+        def ok(title, previous, excerpt, exe):
+            resumed.append((previous, excerpt))
+            return previous + 'x'
+        final = r.build(request, partial, 'unused', ok, checkpoint=saved.append)
+        self.assertEqual(len(resumed), 2, 'only the two missing chunks may be paid again')
+        self.assertEqual(resumed[0], ('xx', LONG_TEXT[120000:180000]))
+        self.assertEqual(final['summary'], 'xxxx')
+        self.assertNotIn('partial', final)
+        self.assertEqual(final['source_length'], len(LONG_TEXT))
+
+    def test_changed_text_discards_checkpoint_and_failed_checkpoint_write_is_harmless(self):
+        saved = []
+        r.build(dict(REQ, text=LONG_TEXT), None, 'unused', lambda t, p, e, x: p + 'x', checkpoint=saved.append)
+        stale = saved[0]
+        calls = []
+        def model(title, previous, excerpt, exe):
+            calls.append((previous, excerpt))
+            return previous + 'y'
+        def disk_full(state):
+            raise OSError('disk full')
+        other = dict(REQ, text='Ganz anderer Anfang.\n' * 20000)
+        result = r.build(other, stale, 'unused', model, checkpoint=disk_full)
+        self.assertEqual(calls[0][0], '', 'checkpoint of a different text must not be reused')
+        self.assertTrue(result['summary'].startswith('y'))
+
+    def test_sync_resumes_failed_long_first_read_and_never_delivers_partial(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent.resolve()) as t, patch.object(r, 'HERE', Path(t)/'pc'):
+            r.HERE.mkdir()
+            device = Path(t)/'device'
+            name = 'a'*32 + '.json'
+            requests = device/'koreader/settings/reading_recap_requests'
+            requests.mkdir(parents=True)
+            r.atomic_json(requests/name, dict(REQ, text=LONG_TEXT))
+            calls = []
+            def flaky(title, previous, excerpt, exe):
+                calls.append(excerpt)
+                if len(calls) == 3:
+                    raise RuntimeError('offline')
+                return previous + 'x'
+            self.assertEqual(r.sync(device, 'fake', flaky), 1)
+            self.assertEqual(len(calls), 3)
+            self.assertFalse((device/'koreader/settings/reading_recaps'/name).exists())
+            cached = json.loads((r.HERE/'recap-cache'/name).read_text(encoding='utf-8'))
+            self.assertTrue(cached['partial'])
+            self.assertEqual(cached['source_length'], 120000)
+
+            again = []
+            def ok(title, previous, excerpt, exe):
+                again.append(previous)
+                return previous + 'x'
+            self.assertEqual(r.sync(device, 'fake', ok), 0)
+            self.assertEqual(again, ['xx', 'xxx'])
+            delivered = json.loads((device/'koreader/settings/reading_recaps'/name).read_text(encoding='utf-8'))
+            self.assertTrue(delivered['text'].endswith('xxxx'))
+            final = json.loads((r.HERE/'recap-cache'/name).read_text(encoding='utf-8'))
+            self.assertNotIn('partial', final)
+
+
 class StartupTest(unittest.TestCase):
     def test_script_starts_in_isolated_mode_from_foreign_directory(self):
         # sync.ps1 runs `python -I recap_sync.py`; -I drops the script folder from sys.path.
