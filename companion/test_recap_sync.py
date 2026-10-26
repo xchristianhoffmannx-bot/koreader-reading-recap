@@ -1,6 +1,8 @@
 import copy
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -109,6 +111,18 @@ class SyncTest(unittest.TestCase):
                 self.assertEqual(second['generator'], 'gemini:test-two')
                 payload = json.loads(model.call_args.args[0].split('\n', 1)[1])
                 self.assertEqual(payload['previous_recap'], '')
+
+
+class StartupTest(unittest.TestCase):
+    def test_script_starts_in_isolated_mode_from_foreign_directory(self):
+        # sync.ps1 runs `python -I recap_sync.py`; -I drops the script folder from sys.path.
+        # Unit tests import the module directly and cannot catch a broken real start.
+        script = Path(r.__file__).resolve()
+        with tempfile.TemporaryDirectory() as cwd:
+            result = subprocess.run([sys.executable, '-I', str(script), '--help'],
+                                    cwd=cwd, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('--device', result.stdout)
 
 
 if __name__ == '__main__': unittest.main()
